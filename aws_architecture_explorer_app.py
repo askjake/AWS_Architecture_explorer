@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import inspect
 from pathlib import Path
+from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 import streamlit as st
@@ -765,6 +766,60 @@ def sidebar_controls() -> Dict[str, Any]:
     return {"max_edges": int(max_edges)}
 
 
+# --- NEW HELPER FUNCTION FOR PATH FILTERING ---
+def filter_graph_to_path(nodes: List[Node], edges: List[Edge], selected_id: str) -> Tuple[List[Node], List[Edge]]:
+    """
+    Returns a subset of nodes and edges representing the ancestors and descendants
+    of the selected_id.
+    """
+    if not selected_id:
+        return nodes, edges
+
+    # Create adjacency maps
+    parent_map = defaultdict(list)  # child_id -> [parent_ids]
+    child_map = defaultdict(list)  # parent_id -> [child_ids]
+
+    # Map edges
+    # Note: streamlit-agraph edges usually store IDs in source/target
+    for e in edges:
+        parent_map[e.target].append(e.source)
+        child_map[e.source].append(e.target)
+
+    ids_to_keep = {selected_id}
+
+    # 1. Traverse Up (Ancestors)
+    queue = [selected_id]
+    visited = set()
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        ids_to_keep.add(current)
+        # Add parents to queue
+        for p in parent_map[current]:
+            queue.append(p)
+
+    # 2. Traverse Down (Descendants)
+    queue = [selected_id]
+    visited = set()  # Reset visited for downstream
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        ids_to_keep.add(current)
+        # Add children to queue
+        for c in child_map[current]:
+            queue.append(c)
+
+    # Filter the original lists
+    final_nodes = [n for n in nodes if n.id in ids_to_keep]
+    final_edges = [e for e in edges if e.source in ids_to_keep and e.target in ids_to_keep]
+
+    return final_nodes, final_edges
+
+
 def main() -> int:
     st.set_page_config(page_title="MongoBleed Architecture Explorer", layout="wide")
     ss_init()
@@ -780,7 +835,9 @@ def main() -> int:
         return 0
 
     st.title("MongoBleed Architecture Explorer")
-    st.caption(f"Snapshot: {st.session_state.get('snapshot_path','(in-memory)')}")
+    st.caption(f"Snapshot: {st.session_state.get('snapshot_path', '(in-memory)')}")
+
+    # Metadata display
     meta = {
         "schema_version": snap.get("schema_version"),
         "generated_at": snap.get("generated_at"),
@@ -788,7 +845,8 @@ def main() -> int:
         "bastion": snap.get("bastion"),
         "options": snap.get("options", {}),
     }
-    st.code(json.dumps(meta, indent=2), language="json")
+    with st.expander("Snapshot Metadata"):
+        st.code(json.dumps(meta, indent=2), language="json")
 
     tabA, tabB = st.tabs(["A) Hierarchy view", "B) Outside-in security review"])
 
@@ -799,7 +857,9 @@ def main() -> int:
             st.warning("streamlit-agraph is not installed; showing JSON only.")
             st.json(snap)
         else:
-            with st.expander("Hierarchy view controls", expanded=True):
+            # --- Controls Row ---
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
                 view_style_label = st.selectbox(
                     "Diagram style",
                     [
@@ -807,44 +867,39 @@ def main() -> int:
                         "EKS-centered",
                         "Ingress-centered",
                     ],
-                    index=0,
-                    help="Switch the root of the diagram. All styles render as a hierarchy-first (family tree) to stay readable.",
+                    index=0
                 )
-                view_style = {
-                    "VPC-centered (default)": "vpc",
-                    "EKS-centered": "eks",
-                    "Ingress-centered": "ingress",
-                }[view_style_label]
 
-                if view_style == "vpc":
-                    st.caption("**VPC-centered:** Region → VPC → buckets → resources. Best default for most accounts.")
-                elif view_style == "eks":
-                    st.caption("**EKS-centered:** Region → EKS → Nodegroups → (subnets/SGs). Great for cluster troubleshooting.")
-                else:
-                    st.caption("**Ingress-centered:** Internet-facing load balancers → VPC → downstream (EKS/RDS/etc). Great for traffic-path conversations.")
+            # Map label to style key
+            view_style = {
+                "VPC-centered (default)": "vpc",
+                "EKS-centered": "eks",
+                "Ingress-centered": "ingress",
+            }[view_style_label]
 
-                ingress_include_internal = False
-                if view_style == "ingress":
-                    ingress_include_internal = st.checkbox(
-                        "Include internal load balancers under downstream",
-                        value=False,
-                        help="Adds internal LBs found in the same VPC as additional downstream nodes (requires \"Include non-internet LBs in snapshot\" in the sidebar).",
-                    )
+            ingress_include_internal = False
+            if view_style == "ingress":
+                with c2:
+                    ingress_include_internal = st.checkbox("Include internal LBs", value=False)
 
+            with c3:
                 detail_level = st.slider(
-                    "Detail level (0 = VPC summary, 3 = full subnets/SGs + placement edges)",
-                    min_value=0,
-                    max_value=3,
-                    value=2,
+                    "Detail level",
+                    min_value=0, max_value=3, value=2,
+                    help="0=Summary, 3=Full Details"
                 )
-                show_subnet_nodes = st.checkbox("Show subnet nodes", value=(detail_level >= 3))
-                show_sg_nodes = st.checkbox("Show security group nodes", value=(detail_level >= 3))
+
+            with c4:
+                # Calculate boolean flags based on slider
+                show_subnet_nodes = (detail_level >= 3)
+                show_sg_nodes = (detail_level >= 3)
                 show_placement_edges = st.checkbox(
-                    "Show placement edges (resource → subnet/SG). Can add clutter.",
+                    "Show placement edges",
                     value=False,
                     disabled=not (show_subnet_nodes or show_sg_nodes),
                 )
 
+            # --- Build Full Graph ---
             nodes, edges, payloads = build_hierarchy_graph(
                 snap,
                 style=view_style,
@@ -856,45 +911,65 @@ def main() -> int:
                 show_placement_edges=show_placement_edges,
             )
 
-            left, right = st.columns([2, 1], gap="large")
+            # --- Apply Selection Filter (Path Cutout) ---
+            selected_id = st.session_state.get("selected_node", "")
 
-            with left:
-                # Prefer a tree layout to avoid node overlap.
-                try:
-                    config = Config(
-                        width="100%",
-                        height=720,
-                        directed=True,
-                        physics=False,
-                        hierarchical=True,
-                    )
-                except TypeError:
-                    # Older streamlit-agraph versions may not support hierarchical=True.
-                    config = Config(
-                        width="100%",
-                        height=720,
-                        directed=True,
-                        physics=False,
-                    )
+            # Button to clear selection if user gets stuck in a focused view
+            if selected_id:
+                if st.button("🔄 Clear Selection / Show Full Graph"):
+                    st.session_state["selected_node"] = ""
+                    st.rerun()
 
-                selected = agraph(nodes=nodes, edges=edges, config=config)
+            display_nodes, display_edges = filter_graph_to_path(nodes, edges, selected_id)
 
-                node_id = ""
-                if isinstance(selected, dict) and selected.get("nodes"):
-                    node_id = selected["nodes"][0]
-                elif isinstance(selected, str):
-                    node_id = selected
+            # --- Render Graph (Left-to-Right) ---
+            # Using hierarchical direction "LR"
+            try:
+                config = Config(
+                    width="100%",
+                    height=700,
+                    directed=True,
+                    physics=False,
+                    hierarchical=True,
+                    direction="LR",  # <--- CHANGED: Left-Right orientation
+                    sortMethod="directed"
+                )
+            except TypeError:
+                # Fallback for older library versions
+                config = Config(width="100%", height=700, directed=True, physics=False)
 
-                if node_id:
-                    st.session_state["selected_node"] = node_id
+            # Render
+            selected = agraph(nodes=display_nodes, edges=display_edges, config=config)
 
-            with right:
-                st.markdown("### Selection details (persistent)")
-                node_id = st.session_state.get("selected_node", "")
-                if node_id:
-                    st.code(json.dumps(payloads.get(node_id, {}), indent=2), language="json")
-                else:
-                    st.write("Click a node to view details. Snapshot stays loaded during reruns.")
+            # Update Selection State
+            # Note: agraph returns None on deselect (click background) or the ID string on select
+            if selected and selected != st.session_state.get("selected_node"):
+                st.session_state["selected_node"] = selected
+                st.rerun()
+            elif selected is None and st.session_state.get("selected_node"):
+                # If user clicked background, clear selection
+                st.session_state["selected_node"] = ""
+                st.rerun()
+
+            st.divider()
+
+            # --- Selection Details (Below Diagram) ---
+            st.markdown("### Selection details (persistent)")
+
+            if selected_id:
+                # Retrieve payload using the ID
+                details = payloads.get(selected_id, {})
+
+                # Create a nice display area
+                d_col1, d_col2 = st.columns([1, 3])
+                with d_col1:
+                    st.info(f"**Selected Node:**\n\n{selected_id}")
+                    # You could extract 'kind' from ID if useful: id.split(':')[0]
+                with d_col2:
+                    st.json(details)
+            else:
+                st.info("Click a node in the diagram above to isolate its path and view details here.")
+
     with tabB:
         st.subheader("Outside-in security review")
         findings = outside_in_findings(snap)
@@ -905,10 +980,10 @@ def main() -> int:
             findings = [
                 r for r in findings
                 if qq in (
-                    str(r.get("Name", "")).lower()
-                    + " " + str(r.get("DNS", "")).lower()
-                    + " " + str(r.get("SGs", "")).lower()
-                    + " " + str(r.get("VpcId", "")).lower()
+                        str(r.get("Name", "")).lower()
+                        + " " + str(r.get("DNS", "")).lower()
+                        + " " + str(r.get("SGs", "")).lower()
+                        + " " + str(r.get("VpcId", "")).lower()
                 )
             ]
 
